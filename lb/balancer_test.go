@@ -147,3 +147,45 @@ func TestUnknownPolicyRejected(t *testing.T) {
 		t.Fatalf("未知策略应被拒绝为 rule_invalid, got %v", err)
 	}
 }
+
+// TestLeastConnBalancedPairsReturnToZero 在均衡器单元层直接验证：
+// 无论上层把某次尝试判定为成功、失败、超时还是跳过，PickAndBegin/Begin 的 +1
+// 都必须有 End 的 -1 成对归还；一批交错操作结束后计数严格回到起始值。
+func TestLeastConnBalancedPairsReturnToZero(t *testing.T) {
+	lc := newLeastConn()
+	pool := mkIDs("a", "b", "c")
+	var wg sync.WaitGroup
+
+	// 模拟多种结局的交错：PickAndBegin 后立即 End（失败/超时/跳过都走同一归还路径），
+	// 夹杂手工 Begin/End 对。
+	for round := 0; round < 200; round++ {
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			switch r % 3 {
+			case 0:
+				ins, err := lc.PickAndBegin("s", pool, nil) // 模拟“连接前跳过”也要归还
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				lc.End(ins.ID)
+			case 1:
+				lc.Begin("b")
+				lc.End("b")
+			default:
+				ins, err := lc.PickAndBegin("s", pool, map[string]bool{"a": true, "b": true})
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				lc.End(ins.ID)
+			}
+		}(round)
+	}
+	wg.Wait()
+	if all := lc.InflightAll(); len(all) != 0 {
+		t.Fatalf("全部成对操作结束后计数必须归零，不能只涨不落, got %v", all)
+	}
+	t.Logf("least-conn 200 次交错 Begin/End（含跳过、排除候选）后计数归零 map=%v", lc.InflightAll())
+}

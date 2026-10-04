@@ -30,6 +30,18 @@ type ConnBeginner interface {
 	PickAndBegin(service string, candidates []model.Instance, exclude map[string]bool) (model.Instance, error)
 }
 
+// InflightCounter 由维护每实例在途请求计数的均衡器实现（least_conn）。
+// Begin/End 必须与选择互斥且严格成对：
+// 每次 PickAndBegin 或 Begin 的 +1，在该次尝试的任何结局（成功/失败/超时/跳过）
+// 之后都必须有一次 End 的 -1；一批请求全部结束后计数必须回到起始值。
+type InflightCounter interface {
+	Begin(id string)
+	End(id string)
+	Inflight(id string) int
+	// InflightAll 返回全部在途计数为正的实例的计数快照（解释性日志/测试用）。
+	InflightAll() map[string]int
+}
+
 // New 按策略名构造均衡器；weights 用于加权策略（缺省权重为 1）。
 func New(policy Policy, weights map[string]int) (Balancer, error) {
 	switch policy {

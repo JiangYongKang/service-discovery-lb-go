@@ -16,7 +16,7 @@
 | `discovery` | 并发安全的注册表：注册/注销、失效标记、版本化不可变快照、健康集合视图 |
 | `health` | 健康状态机（阈值摘除/恢复）、HTTP 探针、周期/单步探测协调器 `Monitor` |
 | `lb` | `round_robin` / `random` / `weighted`（SWRR）/ `least_conn` 四种策略 |
-| `forwarder` | 真实 HTTP 转发、传输错误分类、幂等去重、重试预算与确定性降级 |
+| `forwarder` | 真实 HTTP 转发、传输错误分类、**幂等结论收敛（成功/失败一致复用、TTL 与容量 FIFO 淘汰）**、重试预算与确定性降级、least_conn 在途计数成对归还 |
 | `router` | 规则版本化、原子热更新（validate-then-swap）、请求编排器 `Dispatcher` |
 | `backend` | 本地后端进程模拟：`/healthz` 探测、故障注入（503/延迟/状态码/断连） |
 | `mesh` | 门面：把上述组件装配成注册、探测、调用、热更新的统一 API |
@@ -94,7 +94,7 @@
 | `round_robin` | 全局单调游标对当前候选集合取模；健康集合变化结论仍确定 |
 | `random` | 随机选择，随机源可注入种子（测试可复现） |
 | `weighted` | nginx 风格平滑加权轮询 SWRR；权重缺省 1，长期比例精确且单轮平滑 |
-| `least_conn` | 选择在途连接数最少者，并列时取候选顺序第一个；`PickAndBegin` 在同一临界区内完成“选择 + 计数 +1” |
+| `least_conn` | 选择在途连接数最少者，并列时取候选顺序第一个；`PickAndBegin` 在同一临界区内完成“选择 + 计数 +1”，结束（成功/失败/超时/跳过）后由同一版本均衡器 -1，全部结束计数归零 |
 
 每个规则版本拥有独立的均衡器游标（按 `规则版本 + 服务` 缓存），
 因此热更新后旧版本在途请求使用的仍是旧策略/旧权重。
@@ -116,6 +116,7 @@
 | `upstream_5xx` | 后端 5xx | 是 |
 | `upstream_4xx` | 后端 4xx | **否** |
 | `no_retry_budget` | 达到 `MaxAttempts` 后仍失败 | – |
+| `dedupe_wait_timeout` | 同键在途 leader 超过等待预算未发布结论（兜底，正常路径不会出现） | – |
 | `rule_invalid` / `service_not_found` | 规则非法 / 服务未配置 | – |
 
 `CallError` 携带 `Kind`、`InstanceID`、可读 `Detail` 与底层 cause，
@@ -139,6 +140,59 @@
 - 无幂等键的请求：只允许对**确定未到达业务处理**的 `connect_failed` 重试；
   `timeout`（可能已在后端执行）直接返回，绝不重试，避免重复扣款类副作用。
 - 后端业务计数只在“真正开始处理请求”后递增，可直接核对副作用次数。
+
+### 5.4 结果复用（结论收敛）语义
+
+携带 `IdempotencyKey` 的请求，无论同时打进来还是前后脚打进来，最终都收敛到
+**同一份结论**（`forwarder.CachedOutcome`）。成功与失败共用同一结构，由 `Err` 区分：
+
+| 维度 | 语义 |
+| --- | --- |
+| 收敛对象 | leader 实际得到的最终结论：成功（实例/状态码/响应头/尝试链）或失败（错误对象） |
+| 保留窗口 `TTL` | 每条结论保留固定时长（**成功与失败一致**，默认 30s），到期后惰性删除 |
+| 容量上限 `MaxEntries` | 结论总条数上限（默认 4096）；发布新结论超限时先清过期项，再按**最旧发布顺序 FIFO** 淘汰 |
+| 淘汰后行为 | 过期或被淘汰的键再次请求时，当作**一次全新请求**正常执行，不卡住、不报错 |
+| 主动清理 | `Forwarder.Dedupe().Sweep()` / `Mesh.SweepResultCache()` 可周期性清理；不清理也安全（惰性） |
+| 失败能否复用 | **能，且必须复用为失败**：复用方拿到的是同一个错误对象，`model.ErrKind(err)` 保持原类别，绝不会以“成功 + status=0”返回 |
+
+失败结论的类别区分（所有在途等待者与后来者拿到同一结论）：
+
+| 原始情形 | 最终结论 `ErrKind` | 原始原因保留 |
+| --- | --- | --- |
+| 起始/重放时整套后端无 HEALTHY 实例 | `no_healthy_instance`（立即返回，不消耗预算） | – |
+| 连不上后端 | 预算内可重试；耗尽后 `no_retry_budget` | cause 链保留 `connect_failed` |
+| 单次尝试超时 | 幂等请求可重试；耗尽后 `no_retry_budget` | cause 链保留 `timeout` |
+| 后端返回 4xx | `upstream_4xx`（首次即返回，不重试） | 原类别 |
+| 后端返回 5xx | 预算内重试；耗尽后 `no_retry_budget` | cause 链保留 `upstream_5xx` |
+
+判定依据可用 `model.ErrKind(err)` 读最终类别、沿 `errors.Unwrap` 链（或 `errors.As`）
+读原始类别，`model.DescribeKind(kind)` 取中文解释。
+
+**无健康实例的有界性**：leader 即使在“起始即无健康候选”路径也会发布结论，
+因此同键并发调用不会挂起；等待方另设 `WaitBudget`（默认 10s）兜底，
+超时得到明确的 `dedupe_wait_timeout`，绝不无限等待。调用方自身 ctx 结束时返回
+`timeout`（detail 标注“等待同键结论期间放弃”）。
+
+配置入口：`forwarder.WithDedupeConfig(DedupeConfig{TTL, MaxEntries, WaitBudget, Now})`，
+或装配时使用 `mesh.Config{DedupeTTL, DedupeMaxEntries, DedupeWaitBudget}`；
+`Now` 为可注入时钟，供确定性单测推进 TTL。
+
+### 5.5 在途计数（least_conn）如何解释
+
+- `least_conn` 选择当前在途请求数最少的健康候选；`PickAndBegin` 在**同一临界区**
+  完成“选择 + 计数 +1”，因此并发涌入时不会因计数更新滞后而反复选中同一实例。
+- **在哪计数就在哪归还**：转发器通过选择器自身实现的
+  `InflightBegin/InflightEnd`（内部经 `lb.InflightCounter`）把 -1 归还到
+  **同一个规则版本**的均衡器。每次尝试无论成功、失败、超时还是“连接前被跳过”，
+  +1 都严格成对地有一次 -1；一批请求全部结束后计数必须回到起始值 0（有测试断言）。
+- 每次调度日志输出三元组解释：`rules_v`（规则版本）+ `registry_v`（注册表版本）
+  + `inflight`（选择时刻各实例在途数快照），即“**当时的在途数 + 规则版本 +
+  注册表版本**”完整决定路由结论。
+- 与热更新的关系：均衡器按“规则版本 + 服务”缓存，热更新换版后新版本的计数器
+  **从 0 开始**，不继承旧版本在途数；旧版本在途请求持有的是旧均衡器引用。
+  可用 `Dispatcher.BalancerInflight(version, service)` 查询某版本计数快照。
+- 失败实例不会因失败重放被“放回”健康集合：转发层从不修改健康集合，
+  失败只是本次请求内排除 + 复用失败结论；健康集合的唯一写者仍是健康检查状态机。
 
 ---
 
@@ -175,7 +229,7 @@
 go build ./...
 go vet ./...
 
-# 全量单元/集成测试
+# 全量单元/集成测试（日志带“业务 / 用例 / 结果”前缀，-v 可见覆盖明细）
 go test ./... -v
 
 # 并发场景必须在竞态检测下多轮复跑（全部通过、无 DATA RACE）
@@ -187,6 +241,56 @@ go test ./... -cover
 # 端到端演示（注册→就绪→故障摘除→重试→热更新）
 go run ./cmd/demo
 ```
+
+### 8.1 本轮新增/扩展的关键测试
+
+| 测试 | 覆盖的业务 / 用例 / 结果 |
+| --- | --- |
+| `forwarder.TestDedupeConcurrentSameKeySingleSideEffect` | 业务=幂等转发；同键 20 并发；结果=后端仅 1 次副作用，1 leader + 19 复用 |
+| `forwarder.TestFailureOutcomeConcurrentlyReused` | 业务=失败收敛；4xx / 5xx；结果=12 并发 + 重放全部拿到同一失败类别，无一记为成功 |
+| `forwarder.TestTransportFailureOutcomeReused` | 业务=失败收敛；连接失败 / 超时；结果=`no_retry_budget` 的 cause 分别保留 `connect_failed`/`timeout` |
+| `forwarder.TestExpiredFailureRetriedAsFreshRequest` | 业务=保留窗口；失败缓存 TTL 过期 + 后端恢复；结果=同键作为全新请求成功 |
+| `forwarder.TestFollowerBoundedWaitWhenLeaderNeverPublishes` | 业务=有界等待；leader 异常不发布；结果=follower 在 WaitBudget 内得到 `dedupe_wait_timeout` |
+| `forwarder.TestDedupeTTLExpiryMakesKeyFresh` | 业务=存储 TTL；过期清理、Sweep 只删过期、过期键再来为全新 leader |
+| `forwarder.TestDedupeCapacityFIFOEviction` | 业务=存储容量；超量按 FIFO 淘汰、条数恒定、被淘汰键可重新执行 |
+| `forwarder.TestDedupeFailureOutcomeReusedAsFailure` | 业务=失败复用；六类失败；结果=类别可区分且 `Failed()=true` |
+| `forwarder.TestDedupeWaitersConverge` | 业务=在途收敛；16 等待者；成功/失败两版均收敛到同一份结论 |
+| `mesh.TestNoHealthySameKeyConvergesBounded` | 业务=整套后端不可用；同键 24 并发 + 重放 + 全新键；结果=有限时间内全部 `no_healthy_instance` |
+| `mesh.TestCachedFailureExpiresThenFreshSuccess` | 业务=淘汰；短 TTL 下失败过期、实例恢复；结果=同键全新执行成功、后端处理 1 次 |
+| `mesh.TestResultCacheCapacityEvictionAtMesh` | 业务=容量上限；容量 3 发布 5 条；结果=最旧 FIFO 淘汰，淘汰键重放真正再打后端 |
+| `mesh.TestLeastConnInflightReturnsToZero` | 业务=在途计数；2 长 + 20 短混合；结果=峰值与真实在途一致、结束后归零 |
+| `mesh.TestLeastConnSurgeSpreadsAcrossInstances` | 业务=并发涌入；40 请求同时放行；结果=均匀分散（极差受限），无反复选中同一实例 |
+| `mesh.TestLeastConnInflightZeroAfterFailures` | 业务=失败/超时；连接失败 + 5xx + 超时 12 次；结果=计数全部成对归还归零 |
+| `mesh.TestLeastConnInflightAcrossHotUpdate` | 业务=热更新并发；旧版本在途时换版；结果=新版本计数从 0 起、不串味、结束归零 |
+| `lb.TestLeastConnBalancedPairsReturnToZero` | 业务=计数单元不变量；200 次交错 Begin/End（含跳过/排除候选）；结果=严格归零 |
+
+既有并发用例（`TestConcurrentUpDown` / `TestHotUpdateDuringRequests` /
+`TestDeregisterRaceGuard` 等）在 `-race -count=10` 下多轮复跑不回归。
+
+---
+
+## 9. 兼容范围与约束
+
+- **Go 版本**：go.mod 声明 `go 1.25.0`（在 go1.26 工具链下构建验证）。
+- **API 兼容**：
+  - `forwarder.NewDedupeStore()` 无参构造改为 `NewDedupeStore(DedupeConfig{})`；
+    零值配置即等价旧默认（另加 TTL/容量/等待预算），仅包内使用，外部无破坏；
+  - `forwarder.New`、`Forwarder.Execute`、`router.Dispatcher`、`mesh.New` 的既有
+    签名与默认行为保持兼容；新增能力均通过 Option 或 `mesh.Config` 新字段开启；
+  - 新增导出：`forwarder.CachedOutcome/DedupeConfig`、`Forwarder.Dedupe()`、
+    `lb.InflightCounter`、`Dispatcher.BalancerInflight`、
+    `Mesh.SweepResultCache()/CachedResultCount()`。
+- **语义变化（行为修正，调用方需知悉）**：
+  - 同键失败不再被错误地当成成功复用：复用失败结论时 `Execute` 返回非 nil error；
+  - 起始无健康实例时同键 follower 不再无限等待，而是立即收敛到 `no_healthy_instance`；
+  - 单实例/候选提前排空且预算已用尽时，最终结论为 `no_retry_budget`（cause 保留
+    最后一次真实失败类别），此前会误报为 `no_healthy_instance`；
+  - `least_conn` 在真实装配下的在途计数现在会正确回落（此前转发器未把 -1
+    归还到均衡器），一批请求结束后归零。
+- **不引入**后台清理协程：淘汰全部惰性执行；`Sweep` 为可选的主动维护入口。
+- **不修改**既有注册/注销、健康状态机、规则校验与热更新的原子性保证。
+
+### 8.2 既有能力的测试（回归基线）
 
 测试覆盖（均带实例状态与判定依据日志，`go test -v` 可见）：
 

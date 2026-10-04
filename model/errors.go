@@ -39,6 +39,10 @@ const (
 	ErrServiceNotFound ErrorKind = "service_not_found"
 	// ErrRetryDisabled 当前规则显式关闭重试。
 	ErrRetryDisabled ErrorKind = "retry_disabled"
+	// ErrDedupeWaitTimeout 同幂等键的在途 leader 在等待预算内未发布结论。
+	// 这是兜底保护：正常路径（含起始无健康实例、leader 被取消）leader 都会发布结论，
+	// follower 不应长时间或无限挂起。
+	ErrDedupeWaitTimeout ErrorKind = "dedupe_wait_timeout"
 )
 
 // RetryableByDefault 返回该错误类别是否属于默认可重试的传输类错误。
@@ -129,6 +133,8 @@ func DescribeKind(k ErrorKind) string {
 		return "当前路由规则中不存在该服务"
 	case ErrRetryDisabled:
 		return "规则显式关闭重试，首次失败即降级返回"
+	case ErrDedupeWaitTimeout:
+		return "同键在途请求超过等待预算仍未发布结论，按失败返回而非继续挂起"
 	default:
 		return "未知错误类别"
 	}

@@ -117,6 +117,28 @@ func (s *snapshotSelector) pick(exclude map[string]bool, begin bool) (model.Inst
 	return s.bal.Pick(s.service, candidates, exclude)
 }
 
+// inflightBegin/inflightEnd 把在途计数写入“本请求规则版本”的均衡器：
+// PickAndBegin 在哪 +1，结束就在同计数器 -1，热更新换出的新版本不会串到旧计数上。
+func (s *snapshotSelector) InflightBegin(id string) {
+	if ic, ok := s.bal.(lb.InflightCounter); ok {
+		ic.Begin(id)
+	}
+}
+
+func (s *snapshotSelector) InflightEnd(id string) {
+	if ic, ok := s.bal.(lb.InflightCounter); ok {
+		ic.End(id)
+	}
+}
+
+// inflightSnapshot 返回当前版本均衡器各实例在途数（仅 least_conn 支持），供日志解释。
+func (s *snapshotSelector) inflightSnapshot() map[string]int {
+	if ic, ok := s.bal.(lb.InflightCounter); ok {
+		return ic.InflightAll()
+	}
+	return nil
+}
+
 // Dispatch 执行一次完整请求；规则版本与实例视图在请求开始时冻结。
 func (d *Dispatcher) Dispatch(ctx context.Context, req model.RequestContext) (*forwarder.Result, error) {
 	rules := d.router.Current()
@@ -140,7 +162,26 @@ func (d *Dispatcher) Dispatch(ctx context.Context, req model.RequestContext) (*f
 		req.Service, rules.Version, snap.Version, rule.Policy, len(healthyIDs))
 
 	sel := &snapshotSelector{service: req.Service, snap: snap, bal: bal, healthyIDs: healthyIDs}
+	// 路由结论可由三元组解释：规则版本 + 注册表版本 + 当时各实例在途数
+	// （least_conn 下选择即基于该计数；其他策略在途数为 nil）。
+	d.logf("[dispatch] service=%s rules_v=%d registry_v=%d policy=%s healthy=%d inflight=%v",
+		req.Service, rules.Version, snap.Version, rule.Policy, len(healthyIDs), sel.inflightSnapshot())
 	return d.fwd.Execute(ctx, req, sel, rule.ToForwardRetry())
+}
+
+// BalancerInflight 暴露“规则版本 + 服务”对应均衡器当前的在途计数快照。
+// 仅 least_conn 策略返回非空 map；用于在途计数归零与热更新隔离的可解释校验。
+func (d *Dispatcher) BalancerInflight(version uint64, service string) map[string]int {
+	d.bcMu.Lock()
+	b, ok := d.balancers[balancerKey{version: version, service: service}]
+	d.bcMu.Unlock()
+	if !ok {
+		return nil
+	}
+	if ic, ok := b.(lb.InflightCounter); ok {
+		return ic.InflightAll()
+	}
+	return nil
 }
 
 // Filter 是转发器使用的连接前复核函数。

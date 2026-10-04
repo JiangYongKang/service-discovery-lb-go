@@ -80,3 +80,16 @@ func (b *leastConn) Inflight(id string) int {
 	defer b.mu.Unlock()
 	return b.inflight[id]
 }
+
+// InflightAll 返回所有计数为正的实例的在途数快照。
+func (b *leastConn) InflightAll() map[string]int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make(map[string]int, len(b.inflight))
+	for id, n := range b.inflight {
+		if n > 0 {
+			out[id] = n
+		}
+	}
+	return out
+}

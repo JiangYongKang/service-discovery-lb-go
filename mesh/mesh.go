@@ -28,6 +28,12 @@ type Config struct {
 	Probe            health.ProbeFunc
 	ProbeInterval    time.Duration
 	InitialRules     router.Rules
+	// DedupeTTL 同键结论保留时长（成功/失败一致）；<=0 使用转发器默认值。
+	DedupeTTL time.Duration
+	// DedupeMaxEntries 结论总条数上限，超限按最旧发布顺序淘汰；<=0 使用默认值。
+	DedupeMaxEntries int
+	// DedupeWaitBudget 同键 follower 等待在途结论的最长时间；<=0 使用默认值。
+	DedupeWaitBudget time.Duration
 	Logf             func(format string, args ...any)
 }
 
@@ -36,6 +42,11 @@ func New(cfg Config) (*Mesh, error) {
 	logf := cfg.Logf
 	if logf == nil {
 		logf = func(string, ...any) {}
+	}
+	dedupeCfg := forwarder.DedupeConfig{
+		TTL:        cfg.DedupeTTL,
+		MaxEntries: cfg.DedupeMaxEntries,
+		WaitBudget: cfg.DedupeWaitBudget,
 	}
 	reg := discovery.NewRegistry()
 	checker := health.New(health.Config{
@@ -46,10 +57,10 @@ func New(cfg Config) (*Mesh, error) {
 	if err != nil {
 		return nil, err
 	}
-	fwd := forwarder.New(nil, forwarder.WithLogger(logf))
+	fwd := forwarder.New(nil, forwarder.WithDedupeConfig(dedupeCfg), forwarder.WithLogger(logf))
 	dsp := router.NewDispatcher(reg, rt, fwd, router.WithDispatcherLogger(logf))
 	// 转发器必须使用编排器的连接前复核，堵截并发注销/摘除。
-	fwd = forwarder.New(dsp.Filter, forwarder.WithLogger(logf))
+	fwd = forwarder.New(dsp.Filter, forwarder.WithDedupeConfig(dedupeCfg), forwarder.WithLogger(logf))
 	dsp = router.NewDispatcher(reg, rt, fwd, router.WithDispatcherLogger(logf))
 	mon := health.NewMonitor(checker, reg, reg, cfg.ProbeInterval, logf)
 	return &Mesh{
@@ -95,4 +106,15 @@ func (m *Mesh) Call(ctx context.Context, req model.RequestContext) (*forwarder.R
 // UpdateRules 原子热更新路由规则；失败保留旧版本。
 func (m *Mesh) UpdateRules(next router.Rules) error {
 	return m.Router.Update(next)
+}
+
+// SweepResultCache 主动清理所有已过期的复用结论，返回删除条数。
+// 不调用也安全：结论在下次命中时会被惰性清理；此入口供周期性维护与可观测性使用。
+func (m *Mesh) SweepResultCache() int {
+	return m.Fwd.Dedupe().Sweep()
+}
+
+// CachedResultCount 返回当前保留的结论条数（成功与失败均计入）。
+func (m *Mesh) CachedResultCount() int {
+	return m.Fwd.Dedupe().Len()
 }
