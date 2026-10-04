@@ -98,6 +98,15 @@ func (s *snapshotSelector) PickAndBegin(exclude map[string]bool) (model.Instance
 	return s.pick(exclude, true)
 }
 
+// Release 归还 PickAndBegin 在均衡器上原子占用的在途名额。
+// 选择器持有的是“规则版本 + 服务”对应的均衡器引用，因此归还一定落回
+// 同一个计数实例，即使期间发生规则热更新也不会串味。
+func (s *snapshotSelector) Release(id string) {
+	if r, ok := s.bal.(lb.ConnBeginner); ok {
+		r.End(id)
+	}
+}
+
 func (s *snapshotSelector) pick(exclude map[string]bool, begin bool) (model.Instance, error) {
 	candidates := make([]model.Instance, 0, len(s.snap.Instances))
 	for _, ins := range s.snap.Instances {
@@ -136,11 +145,29 @@ func (d *Dispatcher) Dispatch(ctx context.Context, req model.RequestContext) (*f
 			healthyIDs[ins.ID] = true
 		}
 	}
-	d.logf("[dispatch] service=%s rules_v=%d registry_v=%d policy=%s healthy=%d",
-		req.Service, rules.Version, snap.Version, rule.Policy, len(healthyIDs))
+	d.logf("[dispatch] service=%s rules_v=%d registry_v=%d policy=%s healthy=%d inflight_now=%d",
+		req.Service, rules.Version, snap.Version, rule.Policy, len(healthyIDs), d.InflightTotal(req.Service))
 
 	sel := &snapshotSelector{service: req.Service, snap: snap, bal: bal, healthyIDs: healthyIDs}
 	return d.fwd.Execute(ctx, req, sel, rule.ToForwardRetry())
+}
+
+// InflightTotal 汇总该服务在所有已缓存规则版本均衡器上的在途总数。
+// 每个在途请求始终持有自己开始时的规则版本，因此热更新前后两代 least_conn
+// 计数相加即“当前真实在途”；全部请求结束后该值必须回到 0。
+func (d *Dispatcher) InflightTotal(service string) int {
+	d.bcMu.Lock()
+	defer d.bcMu.Unlock()
+	total := 0
+	for k, b := range d.balancers {
+		if k.service != service {
+			continue
+		}
+		if insp, ok := b.(lb.InflightInspector); ok {
+			total += insp.TotalInflight()
+		}
+	}
+	return total
 }
 
 // Filter 是转发器使用的连接前复核函数。

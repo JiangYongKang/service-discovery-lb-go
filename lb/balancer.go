@@ -26,8 +26,17 @@ type Balancer interface {
 var ErrNoCandidate = model.NewError(model.ErrNoHealthyInstance, "", "过滤后没有可选择的健康候选")
 
 // ConnBeginner 由需要原子“选择并占用连接名额”的均衡器实现。
+// 选择（PickAndBegin）与归还（End）必须成对出现：转发路径在每次尝试结束
+// （成功/失败/超时/连接前跳过）后都调用 End，保证在途计数只涨必落。
 type ConnBeginner interface {
 	PickAndBegin(service string, candidates []model.Instance, exclude map[string]bool) (model.Instance, error)
+	End(id string)
+}
+
+// InflightInspector 提供在途计数观测能力（least_conn 实现）。
+type InflightInspector interface {
+	Inflight(id string) int
+	TotalInflight() int
 }
 
 // New 按策略名构造均衡器；weights 用于加权策略（缺省权重为 1）。

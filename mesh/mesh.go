@@ -28,7 +28,9 @@ type Config struct {
 	Probe            health.ProbeFunc
 	ProbeInterval    time.Duration
 	InitialRules     router.Rules
-	Logf             func(format string, args ...any)
+	// Dedupe 配置结果复用缓存：成功/失败保留窗口与容量上限；零值使用默认参数。
+	Dedupe forwarder.DedupeConfig
+	Logf   func(format string, args ...any)
 }
 
 // New 装配整套组件。
@@ -46,10 +48,13 @@ func New(cfg Config) (*Mesh, error) {
 	if err != nil {
 		return nil, err
 	}
-	fwd := forwarder.New(nil, forwarder.WithLogger(logf))
+	newFwd := func(filter forwarder.InstanceFilter) *forwarder.Forwarder {
+		return forwarder.New(filter, forwarder.WithDedupeConfig(cfg.Dedupe), forwarder.WithLogger(logf))
+	}
+	fwd := newFwd(nil)
 	dsp := router.NewDispatcher(reg, rt, fwd, router.WithDispatcherLogger(logf))
 	// 转发器必须使用编排器的连接前复核，堵截并发注销/摘除。
-	fwd = forwarder.New(dsp.Filter, forwarder.WithLogger(logf))
+	fwd = newFwd(dsp.Filter)
 	dsp = router.NewDispatcher(reg, rt, fwd, router.WithDispatcherLogger(logf))
 	mon := health.NewMonitor(checker, reg, reg, cfg.ProbeInterval, logf)
 	return &Mesh{

@@ -2,6 +2,7 @@ package forwarder
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
 
@@ -17,11 +18,19 @@ type Selector interface {
 	Pick(exclude map[string]bool) (model.Instance, error)
 }
 
-// BeginSelector 由需要原子“选择并占用资源”的均衡器实现（如 least_conn）。
+// BeginSelector 由需要原子“选择并占用资源”的均衡器选择器实现（如 least_conn）。
 // PickAndBegin 必须在均衡器内部临界区完成选择与在途计数 +1，
 // 避免并发请求在计数更新前重复选中同一低负载实例。
 type BeginSelector interface {
 	PickAndBegin(exclude map[string]bool) (model.Instance, error)
+}
+
+// InflightReleaser 归还 PickAndBegin 原子占用的在途名额。
+// 选择与归还必须落在同一个均衡器计数实例上，
+// 因此归还动作经选择器自身闭环，而不是由外部钩子在别处计数，
+// 从而保证“长/短请求、失败、超时、跳过”任何路径下计数都只涨必落。
+type InflightReleaser interface {
+	Release(id string)
 }
 
 // RetryPolicy 描述重试与降级规则。
@@ -47,10 +56,11 @@ type Result struct {
 	StatusCode int
 	Header     http.Header
 	Attempts   []model.Attempt
-	DedupeHit  bool
+	// DedupeHit=true 表示该结论复用自同业务键 leader 的已发布结论（成功或失败重放均可能置位）。
+	DedupeHit bool
 }
 
-// Forwarder 负责实际转发、错误分类、幂等去重与重试降级。
+// Forwarder 负责实际转发、错误分类、结论收敛（结果复用）与重试降级。
 //
 // 降级规则（确定性）：
 //   - 起始即无健康候选            -> no_healthy_instance，不消耗尝试；
@@ -61,25 +71,27 @@ type Result struct {
 //
 // 副作用安全：转发器永不修改健康集合（失败实例不会被“放回”，只是本请求内排除）；
 // 非幂等请求（无 IdempotencyKey）仅允许对“确定未产生副作用”的 connect_failed 重试。
+//
+// 结论收敛：携带 IdempotencyKey 的请求，无论同时到达还是保留窗口内重放，
+// 成功与“最终失败”结论各只由 leader 产生一次，其余调用复用同一结论；
+// 失败结论携带可区分错误类别，绝不会被记成成功。
 type Forwarder struct {
-	filter  InstanceFilter
-	dedupe  *DedupeStore
-	onBegin func(id string)
-	onEnd   func(id string)
-	logf    func(format string, args ...any)
+	filter InstanceFilter
+	dedupe *DedupeStore
+	logf   func(format string, args ...any)
 }
 
 // Option 配置转发器。
 type Option func(*Forwarder)
 
-// WithInflightHooks 注入在途计数钩子（如 least_conn 的 Begin/End）。
-func WithInflightHooks(begin, end func(id string)) Option {
-	return func(f *Forwarder) { f.onBegin, f.onEnd = begin, end }
-}
-
 // WithLogger 注入解释性日志。
 func WithLogger(logf func(format string, args ...any)) Option {
 	return func(f *Forwarder) { f.logf = logf }
+}
+
+// WithDedupeConfig 注入结果复用缓存参数（保留窗口、容量上限）。
+func WithDedupeConfig(cfg DedupeConfig) Option {
+	return func(f *Forwarder) { f.dedupe = NewDedupeStoreWith(cfg) }
 }
 
 // New 创建转发器。
@@ -95,26 +107,91 @@ func New(filter InstanceFilter, opts ...Option) *Forwarder {
 	return f
 }
 
+// DedupeStore 暴露结论缓存，便于观测容量与主动淘汰（测试/运维）。
+func (f *Forwarder) DedupeStore() *DedupeStore { return f.dedupe }
+
 // Execute 按重试策略执行请求。
 func (f *Forwarder) Execute(ctx context.Context, req model.RequestContext, sel Selector, rp RetryPolicy) (*Result, error) {
 	if rp.MaxAttempts < 1 {
 		rp.MaxAttempts = 1
 	}
 
-	// 幂等去重：同键并发/重试只允许一个调用真正到达后端。
+	// 幂等结论收敛：同键并发/保留窗口内重放只允许一个调用真正到达后端。
 	if req.IdempotencyKey != "" {
 		leader, wait := f.dedupe.acquire(req.IdempotencyKey)
 		if !leader {
-			<-wait
-			id, status, ok := f.dedupe.Lookup(req.IdempotencyKey)
-			if ok {
-				f.logf("[dedupe] key=%s 复用已完成结果 instance=%s status=%d", req.IdempotencyKey, id, status)
-				return &Result{InstanceID: id, StatusCode: status, DedupeHit: true}, nil
+			// follower：等待在途 leader 的结论；等待本身受调用方截止时间约束，
+			// 任何情况下都能在可预期时间内得到明确结论而不是无限挂起。
+			if err := waitForConclusion(ctx, wait); err != nil {
+				return nil, err
 			}
-			return nil, model.NewError(model.ErrNoRetryBudget, "", "幂等键等待被异常释放")
+			return f.reuseConclusion(req.IdempotencyKey)
 		}
+		// leader：真正执行；成功或最终失败只发布一次结论。
+		res, err := f.runAttempts(ctx, req, sel, rp)
+		f.publishConclusion(req.IdempotencyKey, res, err)
+		return res, err
 	}
 
+	return f.runAttempts(ctx, req, sel, rp)
+}
+
+// reuseConclusion 复用 leader 已发布的结论；失败结论还原为可区分错误，绝不伪装成成功。
+func (f *Forwarder) reuseConclusion(key string) (*Result, error) {
+	o, ok := f.dedupe.lookupOutcome(key)
+	if !ok {
+		// 极端情况下结论恰好在被唤醒后过期/被淘汰：当作一次全新请求由调用方重试，
+		// 这里给出可区分的临时结论，调用方不会被卡死。
+		return nil, model.NewError(model.ErrNoRetryBudget, "", "同键结论已过期或被淘汰，请作为全新请求重试")
+	}
+	if o.Kind == OutcomeSuccess {
+		f.logf("[dedupe] key=%s 复用成功结论 instance=%s status=%d", key, o.InstanceID, o.StatusCode)
+		return &Result{InstanceID: o.InstanceID, StatusCode: o.StatusCode, DedupeHit: true}, nil
+	}
+	f.logf("[dedupe] key=%s 复用失败结论 kind=%s cause=%s instance=%s",
+		key, o.ErrKind, o.CauseKind, o.InstanceID)
+	// 还原失败：外层为最终降级类别（如 no_retry_budget），
+	// cause 保留“原来那一类”（connect_failed/timeout/upstream_5xx/upstream_4xx…），
+	// model.RootKind 可解包，调用方既能看到降级结论也能区分最初原因。
+	detail := "复用同键失败结论: " + o.Detail
+	final := model.NewError(o.ErrKind, o.InstanceID, detail)
+	if o.CauseKind != "" && o.CauseKind != o.ErrKind {
+		final = model.WrapError(o.ErrKind, o.InstanceID,
+			detail+"（原始原因="+string(o.CauseKind)+"："+model.DescribeKind(o.CauseKind)+"）",
+			model.NewError(o.CauseKind, o.InstanceID, o.Detail))
+	}
+	return nil, final
+}
+
+// publishConclusion 由 leader 在得到“最终”结论后发布一次。
+// 重试中途的失败不发布：等待者只应看到整次请求收敛后的唯一结论。
+func (f *Forwarder) publishConclusion(key string, res *Result, err error) {
+	if err == nil {
+		f.dedupe.complete(key, res.InstanceID, res.StatusCode)
+		return
+	}
+	var ce *model.CallError
+	instanceID := ""
+	detail := err.Error()
+	if errors.As(err, &ce) {
+		instanceID = ce.InstanceID
+		detail = ce.Detail
+	}
+	f.dedupe.completeFailure(key, model.ErrKind(err), model.RootKind(err), instanceID, detail)
+}
+
+// releaseInflight 归还一次 PickAndBegin 占用的在途名额。
+func releaseInflight(sel Selector, beganBySelector bool, id string) {
+	if !beganBySelector {
+		return
+	}
+	if r, ok := sel.(InflightReleaser); ok {
+		r.Release(id)
+	}
+}
+
+// runAttempts 执行真正的尝试循环（无去重逻辑，去重由 Execute 包裹）。
+func (f *Forwarder) runAttempts(ctx context.Context, req model.RequestContext, sel Selector, rp RetryPolicy) (*Result, error) {
 	res := &Result{}
 	exclude := make(map[string]bool)
 	attempt := 0 // 已发起的真实尝试次数
@@ -132,6 +209,7 @@ func (f *Forwarder) Execute(ctx context.Context, req model.RequestContext, sel S
 			ins, pickErr = sel.Pick(exclude)
 		}
 		if pickErr != nil {
+			// 无论起始还是重试途中候选排空，都是本次请求的最终失败（在途计数此前已逐次归还）。
 			if attempt == 0 {
 				return res, model.Errf(model.ErrNoHealthyInstance, "",
 					"服务 %s 起始无健康候选: %v", req.Service, pickErr)
@@ -143,9 +221,7 @@ func (f *Forwarder) Execute(ctx context.Context, req model.RequestContext, sel S
 		// 连接前二次复核：堵截并发注销 / 并发摘除。跳过不消耗尝试预算。
 		if f.filter != nil {
 			if cur, ok := f.filter(ins.ID); !ok {
-				if beganBySelector && f.onEnd != nil {
-					f.onEnd(ins.ID) // 归还选择时原子占用的在途计数
-				}
+				releaseInflight(sel, beganBySelector, ins.ID) // 归还选择时原子占用的在途计数
 				reason := "实例在连接前已注销/摘除，跳过且不计尝试"
 				f.logf("[guard] instance=%s %s", ins.ID, reason)
 				res.Attempts = append(res.Attempts, model.Attempt{
@@ -166,13 +242,9 @@ func (f *Forwarder) Execute(ctx context.Context, req model.RequestContext, sel S
 		if rp.PerCallTimeout > 0 {
 			callCtx, cancel = context.WithTimeout(ctx, rp.PerCallTimeout)
 		}
-		if f.onBegin != nil && !beganBySelector {
-			f.onBegin(ins.ID)
-		}
 		status, hdr, _, callErr := doOnce(callCtx, ins, req)
-		if f.onEnd != nil {
-			f.onEnd(ins.ID)
-		}
+		// 任何结论路径（成功/失败/超时）都立即归还在途名额，计数只涨必落。
+		releaseInflight(sel, beganBySelector, ins.ID)
 		cancel()
 
 		if err := Classify(callErr, status, ins.ID); err != nil {
@@ -186,9 +258,6 @@ func (f *Forwarder) Execute(ctx context.Context, req model.RequestContext, sel S
 			f.logf("[attempt %d/%d] instance=%s -> kind=%s status=%d 依据=%s",
 				attempt, rp.MaxAttempts, ins.ID, kind, status, at.Reason)
 
-			if req.IdempotencyKey != "" {
-				f.dedupe.complete(req.IdempotencyKey, ins.ID, status)
-			}
 			// 不可重试类别（如 4xx）：首次失败即降级返回，保留原类别。
 			if !rp.retryable(kind) {
 				return res, err
@@ -213,9 +282,6 @@ func (f *Forwarder) Execute(ctx context.Context, req model.RequestContext, sel S
 		res.Attempts = append(res.Attempts, model.Attempt{
 			InstanceID: ins.ID, StatusCode: status, Reason: "尝试成功",
 		})
-		if req.IdempotencyKey != "" {
-			f.dedupe.complete(req.IdempotencyKey, ins.ID, status)
-		}
 		f.logf("[attempt %d/%d] instance=%s 成功 status=%d", attempt, rp.MaxAttempts, ins.ID, status)
 		return res, nil
 	}

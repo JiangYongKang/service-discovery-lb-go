@@ -96,6 +96,22 @@ func ErrKind(err error) ErrorKind {
 	return ""
 }
 
+// RootKind 沿 cause 链解包到最内层的 CallError 类别。
+// 例如 no_retry_budget(cause=connect_failed) 的根类别是 connect_failed，
+// 用于在“预算耗尽/包装降级”后仍能区分最初导致失败的那一类原因。
+func RootKind(err error) ErrorKind {
+	var root ErrorKind
+	for err != nil {
+		var ce *CallError
+		if !errors.As(err, &ce) {
+			break
+		}
+		root = ce.Kind
+		err = ce.cause
+	}
+	return root
+}
+
 // DescribeKind 给出错误类别的中文判定依据，供日志解释。
 func DescribeKind(k ErrorKind) string {
 	switch k {

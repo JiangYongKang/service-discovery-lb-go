@@ -16,7 +16,7 @@
 | `discovery` | 并发安全的注册表：注册/注销、失效标记、版本化不可变快照、健康集合视图 |
 | `health` | 健康状态机（阈值摘除/恢复）、HTTP 探针、周期/单步探测协调器 `Monitor` |
 | `lb` | `round_robin` / `random` / `weighted`（SWRR）/ `least_conn` 四种策略 |
-| `forwarder` | 真实 HTTP 转发、传输错误分类、幂等去重、重试预算与确定性降级 |
+| `forwarder` | 真实 HTTP 转发、传输错误分类、**同键结论收敛（成功/失败结果复用、TTL、LRU 容量淘汰）**、重试预算与确定性降级 |
 | `router` | 规则版本化、原子热更新（validate-then-swap）、请求编排器 `Dispatcher` |
 | `backend` | 本地后端进程模拟：`/healthz` 探测、故障注入（503/延迟/状态码/断连） |
 | `mesh` | 门面：把上述组件装配成注册、探测、调用、热更新的统一 API |
@@ -96,8 +96,19 @@
 | `weighted` | nginx 风格平滑加权轮询 SWRR；权重缺省 1，长期比例精确且单轮平滑 |
 | `least_conn` | 选择在途连接数最少者，并列时取候选顺序第一个；`PickAndBegin` 在同一临界区内完成“选择 + 计数 +1” |
 
-每个规则版本拥有独立的均衡器游标（按 `规则版本 + 服务` 缓存），
-因此热更新后旧版本在途请求使用的仍是旧策略/旧权重。
+**在途计数闭环（只涨必落）**：`PickAndBegin` 在均衡器临界区内完成选择与 +1，
+归还动作由选择器自身的 `Release`（落到同一代均衡器的 `End`）在每次尝试结束时执行——
+**成功、失败、超时、连接前复核被跳过**的每一条路径都成对归还，不依赖外部钩子。因此：
+
+- 长请求与短请求混合、请求中途失败/超时/实例被跳过，计数都不会错乱；
+- 一批请求全部结束后，在途计数（`leastConn.TotalInflight` / `Dispatcher.InflightTotal`）**回到 0**；
+- 并发涌入在同一临界区“选择 + 计数”，不会因计数更新滞后而反复选中同一实例。
+
+每个规则版本拥有独立的均衡器游标与在途计数（按 `规则版本 + 服务` 缓存），
+因此热更新后旧版本在途请求使用的仍是旧策略/旧权重/旧计数。
+`Dispatcher.InflightTotal(service)` 汇总该服务在所有已缓存版本均衡器上的在途数之和；
+配合调度日志 `rules_v=<规则版本> registry_v=<注册表版本> inflight_now=<当时在途总数>`，
+**热更新之后的每一个路由结论仍可由“当时的在途数 + 规则版本 + 注册表版本”解释清楚，两代计数不串味。**
 
 ---
 
@@ -119,7 +130,9 @@
 | `rule_invalid` / `service_not_found` | 规则非法 / 服务未配置 | – |
 
 `CallError` 携带 `Kind`、`InstanceID`、可读 `Detail` 与底层 cause，
-可用 `model.ErrKind(err)` 解包、`model.DescribeKind(kind)` 取中文判定依据。
+可用 `model.ErrKind(err)` 解包最终类别、`model.RootKind(err)` 解包原因链最内层的
+**原始那一类**（如 `no_retry_budget` 内的 `connect_failed`/`timeout`/`upstream_5xx`）、
+`model.DescribeKind(kind)` 取中文判定依据。同键失败结论复用时保留这两层类别。
 
 ### 5.2 确定性降级规则
 
@@ -129,13 +142,33 @@
 4. 可重试错误但已达 `MaxAttempts` → 返回 `no_retry_budget`，cause 保留最后一次错误；
 5. 重试途中健康候选被排空 → 返回 `no_healthy_instance`，`Attempts` 保留完整尝试链。
 
-### 5.3 重试不产生重复副作用
+### 5.3 重试不产生重复副作用与同键结论收敛（结果复用）
 
-- 请求携带 `IdempotencyKey` 时，`DedupeStore` 保证同一键下：
-  - 只有第一个调用（leader）真正访问后端；
-  - 进行中到达的并发调用等待同一结果；
-  - 完成后到达的调用直接复用结果（`Result.DedupeHit=true`）。
-  - 测试：20 个并发同键请求，后端**仅处理 1 次**，1 leader + 19 复用。
+请求携带 `IdempotencyKey` 时，由带保留窗口与容量上限的 `DedupeStore` 把同键调用收敛到
+**同一份说得清的结论**：
+
+- **只有第一个调用（leader）真正访问后端**；leader 在途期间到达的调用（follower）等待同一结论；
+- **成功结论**：等待者与保留窗口内后来的调用直接复用（`Result.DedupeHit=true`），后端只执行一次。
+  测试：20 个并发同键请求，后端**仅处理 1 次**，1 leader + 19 复用；窗口内重放仍为 0 次额外副作用。
+- **失败结论同样被一致复用，但绝不被记成成功**：
+  - `DedupeStore.Lookup` 只返回成功结论；失败结论永远不会被后来的调用当成成功结果；
+  - 失败结论同时记录**最终降级类别**（如 `no_retry_budget`）与**原因链根类别**
+    （`connect_failed`/`timeout`/`upstream_5xx`/`upstream_4xx`/`no_healthy_instance`）。
+    可用 `model.ErrKind(err)` 取最终类别、`model.RootKind(err)` 取“最初那一类”；
+  - `connect_failed`、`timeout`、4xx/5xx、**整套后端无健康实例**这几类失败，
+    所有并发等待者与窗口内重放者都拿到**同一个**可区分失败。
+- **保留窗口（TTL）**：成功与失败使用各自独立窗口
+  （`DedupeConfig.SuccessTTL` 默认 30s、`FailureTTL` 默认 5s，均可配置）。
+  过期条目惰性清理（占位、读取、容量整理时触发）；**过期之后同键再来即一次全新请求**，
+  正常执行，不会卡住或报错；失败窗口过期 + 后端恢复后同键重试可以成功。
+- **容量上限（LRU）**：`DedupeConfig.Capacity`（默认 4096）限制结论总条数，
+  超限时淘汰**最久未被访问**的键；命中复用会刷新 LRU 位置。在途键不在 LRU 结构中，不会被误淘汰。
+- **等待有界**：follower 等待受自身 `ctx` 截止时间约束（`waitForConclusion`），
+  不会因 leader 长耗时或异常而无限挂起；超时/取消返回可区分的 `timeout`。
+  “当前没有任何健康实例”时，leader 在选实例阶段立即得到 `no_healthy_instance` 并发布，
+  同键并发调用与窗口内重放都在**可预期的极短时间**内拿到明确失败。
+- **失败不复活实例**：失败重放只读取缓存结论，**不经过、也不修改健康集合**，
+  摘除/无健康的实例不会因为重放被重新当成可用。
 - 无幂等键的请求：只允许对**确定未到达业务处理**的 `connect_failed` 重试；
   `timeout`（可能已在后端执行）直接返回，绝不重试，避免重复扣款类副作用。
 - 后端业务计数只在“真正开始处理请求”后递增，可直接核对副作用次数。
@@ -168,7 +201,26 @@
 
 ---
 
-## 8. 验证方法
+## 8. 兼容范围与行为约定
+
+- **仅对携带 `IdempotencyKey` 的请求启用结果复用**；无键请求行为与既有版本一致（按重试策略执行，
+  不写入结论缓存）。键的生成与去重粒度（业务键，而非实例地址）由调用方保证。
+- **成功/失败结论都只在“整次请求的最终结论”产生时发布一次**：重试中途的单次失败不会提前发布，
+  在途等待者只看到收敛后的唯一结论。
+- **失败可复用，但有独立且通常更短的失败保留窗口**：默认成功 30s、失败 5s、容量 4096，
+  可通过 `mesh.Config.Dedupe`（`forwarder.DedupeConfig`）覆盖；零值取默认。
+- 失败结论的复用语义是“**短期内一致地返回同一个可区分失败**”，不是熔断；窗口过期后允许重新尝试，
+  且重放路径完全不触碰健康状态机（摘除的实例不会因重放复活）。
+- **淘汰是安全惰性的**：过期/超量淘汰后同键再来当作全新请求执行，不会报错或卡住；
+  即使 follower 被唤醒时结论恰好过期，也会得到“请作为全新请求重试”的可区分临时结论。
+- 在途计数的选择与归还绑定在同一代（规则版本 + 服务）均衡器上；热更新只影响更新后开始的请求，
+  在途请求继续使用其开始时的版本，两代计数相加即真实在途。
+- 并发安全：结论缓存、注册表、规则发布、在途计数全部在各自临界区/原子指针下访问，
+  整套用例在 `go test ./... -race -count=10` 下无 DATA RACE。
+
+---
+
+## 9. 验证方法
 
 ```bash
 # 构建与静态检查
@@ -199,8 +251,20 @@ go run ./cmd/demo
 | `health.TestJitterNeverRouteableUntilThreshold` | 探测抖动下恢复阈值未达成绝不路由 |
 | `lb.*` | 轮询确定性、空候选、SWRR 精确平滑分布、least-conn 并发不变量、非法策略 |
 | `forwarder.TestDedupeConcurrentSameKeySingleSideEffect` | 20 并发同键仅 1 次副作用 |
+| `forwarder.TestDedupeConcurrentFailureReplayedWithKind` | 同键并发失败结论一致复用、后端仅 1 次、失败不记成成功 |
+| `forwarder.TestDedupeFailureKindsDistinguishable` | connect/timeout/5xx/4xx 根类别可区分地被并发与重放一致复用 |
+| `forwarder.TestDedupeNoHealthyInstanceBoundedWait` | 无健康实例 8 并发在有限时间内得到 no_healthy_instance，重放同样快速失败 |
+| `forwarder.TestDedupeSuccessTTLExpiry` / `TestDedupeFailureTTLExpiry` | 成功/失败保留窗口过期淘汰，同键再来为全新请求（失败恢复后可成功） |
+| `forwarder.TestDedupeStoreLRU` | 容量上限 LRU 淘汰最久未访问、命中刷新、淘汰后可重新发布 |
+| `forwarder.TestDedupeStoreFailureAndSuccessTTL` | 失败/成功独立 TTL（注入时钟），失败不伪装成功 |
+| `forwarder.TestDedupeFollowerBoundedByContext` | follower 等待受自身截止时间约束，不无限挂起 |
+| `forwarder.TestInflightCounterReturnsZero` | 长/短/失败/跳过混合并发结束后在途计数归零 |
 | `forwarder.TestFailedInstanceNeverReturnedToHealthySet` | 失败实例不被重新放回健康集合 |
 | `forwarder.TestNonIdempotentTimeoutNotRetried` | 非幂等超时不重试 |
+| `mesh.TestMeshSameKeyConcurrentSingleSideEffect` | 端到端 20 并发同键 1 次副作用，窗口内重放仍复用 |
+| `mesh.TestMeshNoHealthyInstanceBoundedAndReplay` | 端到端整组不可用有界返回，失败实例不复活，重放同结论 |
+| `mesh.TestMeshFailureOutcomeEvictedThenFreshSuccess` | 端到端失败窗口过期 + 后端恢复后同键重新成功 |
+| `mesh.TestMeshLeastConnInflightZeroAndHotUpdate` | 端到端热更新交错下 60 请求结束跨版本在途归零、负载不压单实例、可重复归零 |
 | `mesh.TestRetryOnConnectFailureNoDuplicateSideEffect` | 连接失败重试到其他健康实例 |
 | `mesh.TestTimeoutExhaustsBudget` / `Test4xxNotRetried` | 超时降级预算 / 4xx 不重试 |
 | `mesh.TestConcurrentUpDown` | 8 worker × 50 请求与反复上下线并发（-race） |

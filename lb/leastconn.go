@@ -74,9 +74,21 @@ func (b *leastConn) End(id string) {
 	}
 }
 
-// Inflight 查询在途数（供日志解释）。
+// Inflight 查询某实例在途数（供日志解释）。
 func (b *leastConn) Inflight(id string) int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.inflight[id]
+}
+
+// TotalInflight 查询该均衡器（规则版本 + 服务）下所有实例的在途总数。
+// 一批请求全部结束后必须回到 0，用于端到端校验“计数只涨必落”。
+func (b *leastConn) TotalInflight() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	total := 0
+	for _, n := range b.inflight {
+		total += n
+	}
+	return total
 }
